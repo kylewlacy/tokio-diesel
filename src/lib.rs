@@ -56,6 +56,17 @@ impl StdError for AsyncError {
     }
 }
 
+struct TransactionError<E>(E);
+
+impl<E> From<diesel::result::Error> for TransactionError<E>
+where
+    E: From<AsyncError>,
+{
+    fn from(error: diesel::result::Error) -> Self {
+        TransactionError(E::from(AsyncError::Error(error)))
+    }
+}
+
 #[async_trait]
 pub trait AsyncSimpleConnection<Conn>
 where
@@ -92,10 +103,11 @@ where
         R: 'static + Send,
         Func: 'static + FnOnce(&Conn) -> QueryResult<R> + Send;
 
-    async fn transaction<R, Func>(&self, f: Func) -> AsyncResult<R>
+    async fn transaction<T, E, Func>(&self, f: Func) -> Result<T, E>
     where
-        R: 'static + Send,
-        Func: 'static + FnOnce(&Conn) -> QueryResult<R> + Send;
+        T: 'static + Send,
+        E: 'static + From<AsyncError> + Send,
+        Func: 'static + FnOnce(&Conn) -> Result<T, E> + Send;
 }
 
 #[async_trait]
@@ -119,15 +131,17 @@ where
     }
 
     #[inline]
-    async fn transaction<R, Func>(&self, f: Func) -> AsyncResult<R>
+    async fn transaction<T, E, Func>(&self, f: Func) -> Result<T, E>
     where
-        R: 'static + Send,
-        Func: 'static + FnOnce(&Conn) -> QueryResult<R> + Send,
+        T: 'static + Send,
+        E: 'static + From<AsyncError> + Send,
+        Func: 'static + FnOnce(&Conn) -> Result<T, E> + Send,
     {
         let self_ = self.clone();
         task::spawn_blocking(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
-            conn.transaction(|| f(&*conn)).map_err(AsyncError::Error)
+            conn.transaction(|| f(&*conn).map_err(TransactionError))
+                .map_err(|tx_error| tx_error.0)
         })
         .await
         .expect("task has panicked")
